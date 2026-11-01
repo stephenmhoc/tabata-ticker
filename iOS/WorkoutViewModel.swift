@@ -1,5 +1,6 @@
 import AVFoundation
 import Observation
+import Sentry
 import SwiftUI
 import UIKit
 
@@ -255,6 +256,28 @@ final class WorkoutViewModel {
         connectivity.send(state, catalog: presetCatalog)
         stateStore.save(state, at: now)
         liveActivityController.sync(state: state, now: now)
+        recordStateForCrashReports()
+    }
+
+    // Set ahead of time because a crash or hang leaves no chance to ask what the workout was doing.
+    private func recordStateForCrashReports() {
+        let breadcrumb = Breadcrumb(level: .info, category: "workout")
+        breadcrumb.message = "\(state.phase.rawValue), round \(state.round), \(state.isRunning ? "running" : "stopped")"
+        SentrySDK.addBreadcrumb(breadcrumb)
+
+        SentrySDK.configureScope { [state] scope in
+            scope.setTag(value: state.phase.rawValue, key: "workout.phase")
+            scope.setContext(value: [
+                "phase": state.phase.rawValue,
+                "round": state.round,
+                "rounds": state.config.rounds,
+                "workDuration": state.config.workDuration,
+                "restDuration": state.config.restDuration,
+                "isRunning": state.isRunning,
+                "soundsEnabled": state.settings.soundsEnabled,
+                "hapticsEnabled": state.settings.hapticsEnabled
+            ], key: "workout")
+        }
     }
 
     private func resetToSelectedPreset() {
