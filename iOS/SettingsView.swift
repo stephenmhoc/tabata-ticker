@@ -31,7 +31,7 @@ struct SettingsView: View {
 
                 Toggle(isOn: $hapticsEnabled) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Haptic feedback on Apple Watch")
+                        Text("Haptic Feedback")
                             .font(.headline)
 
                         Text(hapticsEnabled ? "On" : "Off")

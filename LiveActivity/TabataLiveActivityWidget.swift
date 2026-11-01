@@ -7,13 +7,13 @@ import WidgetKit
 struct TabataLiveActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: TabataLiveActivityAttributes.self) { context in
-            TabataLiveActivityLockScreenView(state: context.state)
-                .activityBackgroundTint(.black.opacity(0.88))
+            TabataLiveActivityLockScreenView(state: context.state, isStale: context.isStale)
+                .activityBackgroundTint(context.isStale ? .black.opacity(0.88) : context.state.cardTint)
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.bottom) {
-                    TabataLiveActivityExpandedView(state: context.state)
+                    TabataLiveActivityExpandedView(state: context.state, isStale: context.isStale)
                 }
             } compactLeading: {
                 TabataLiveActivityPhaseIcon(state: context.state, size: 17, iconSize: 9)
@@ -50,17 +50,47 @@ private struct TabataLiveActivityTimerText: View {
     }
 }
 
-private struct TabataLiveActivityLockScreenView: View {
+// Shown once the app has stopped sending updates, or when the workout has finished, in place of a
+// countdown that would otherwise sit at zero with buttons that look live.
+private struct TabataLiveActivityMessage: View {
     let state: TabataLiveActivityAttributes.ContentState
+    let isStale: Bool
 
     var body: some View {
+        Text(state.summaryText ?? "Open Tabata Ticker to continue")
+            .font(.system(size: 22, weight: .black, design: .rounded))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+    }
+}
+
+private struct TabataLiveActivityLockScreenView: View {
+    let state: TabataLiveActivityAttributes.ContentState
+    let isStale: Bool
+
+    var body: some View {
+        if isStale || state.summaryText != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                TabataLiveActivityPhaseLabel(state: state, dotSize: 7)
+                TabataLiveActivityMessage(state: state, isStale: isStale)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 14)
+            .padding(.horizontal, 18)
+        } else {
+            liveContent
+        }
+    }
+
+    private var liveContent: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack(alignment: .center, spacing: 10) {
                 TabataLiveActivityPhaseLabel(state: state, dotSize: 7)
 
                 Spacer(minLength: 10)
 
-                Text("Round \(state.roundText)")
+                Text(state.roundText)
                     .font(.caption.monospacedDigit().weight(.bold))
                     .foregroundStyle(.white.opacity(0.88))
                     .lineLimit(1)
@@ -80,7 +110,14 @@ private struct TabataLiveActivityLockScreenView: View {
                 TabataLiveActivityControls(state: state, height: 40)
             }
 
-            TabataLiveActivityProgressBar(state: state, height: 6)
+            TabataLiveActivityProgressBar(state: state, height: 6, tint: .white)
+
+            if let nextText = state.nextText {
+                Text(nextText)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.white.opacity(0.88))
+                    .lineLimit(1)
+            }
         }
         .foregroundStyle(.white)
         .padding(.vertical, 14)
@@ -90,8 +127,21 @@ private struct TabataLiveActivityLockScreenView: View {
 
 private struct TabataLiveActivityExpandedView: View {
     let state: TabataLiveActivityAttributes.ContentState
+    let isStale: Bool
 
     var body: some View {
+        if isStale || state.summaryText != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                TabataLiveActivityPhaseLabel(state: state, dotSize: 6)
+                TabataLiveActivityMessage(state: state, isStale: isStale)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            liveContent
+        }
+    }
+
+    private var liveContent: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .center, spacing: 10) {
                 TabataLiveActivityPhaseLabel(state: state, dotSize: 6)
@@ -119,7 +169,7 @@ private struct TabataLiveActivityExpandedView: View {
                 TabataLiveActivityControls(state: state, height: 36)
             }
 
-            TabataLiveActivityProgressBar(state: state, height: 5)
+            TabataLiveActivityProgressBar(state: state, height: 5, tint: state.tint)
         }
         .frame(maxWidth: .infinity)
     }
@@ -190,6 +240,7 @@ private struct TabataLiveActivityPhaseIcon: View {
 private struct TabataLiveActivityProgressBar: View {
     let state: TabataLiveActivityAttributes.ContentState
     let height: CGFloat
+    let tint: Color
 
     var body: some View {
         if state.isRunning {
@@ -199,7 +250,7 @@ private struct TabataLiveActivityProgressBar: View {
                 EmptyView()
             }
             .progressViewStyle(.linear)
-            .tint(state.tint)
+            .tint(tint)
         } else {
             ZStack(alignment: .leading) {
                 Capsule()
@@ -207,7 +258,7 @@ private struct TabataLiveActivityProgressBar: View {
 
                 GeometryReader { proxy in
                     Capsule()
-                        .fill(state.tint)
+                        .fill(tint)
                         .frame(width: proxy.size.width * state.pausedFraction)
                 }
             }
@@ -220,5 +271,11 @@ private struct TabataLiveActivityProgressBar: View {
 private extension TabataLiveActivityAttributes.ContentState {
     var tint: Color {
         Color(red: tintRed, green: tintGreen, blue: tintBlue)
+    }
+
+    // The whole card takes the phase's colour, dark enough to keep white text readable, so WORK and
+    // REST can be told apart from across the room.
+    var cardTint: Color {
+        Color(red: tintRed * 0.72, green: tintGreen * 0.72, blue: tintBlue * 0.72)
     }
 }

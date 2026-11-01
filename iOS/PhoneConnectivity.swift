@@ -4,6 +4,7 @@ import WatchConnectivity
 @MainActor
 final class PhoneConnectivity: NSObject, WCSessionDelegate {
     var onCommand: ((WatchCommandPayload) -> Void)?
+    var onReady: (() -> Void)?
 
     func activate() {
         guard WCSession.isSupported() else {
@@ -46,7 +47,20 @@ final class PhoneConnectivity: NSObject, WCSessionDelegate {
         _ session: WCSession,
         activationDidCompleteWith activationState: WCSessionActivationState,
         error: (any Error)?
-    ) {}
+    ) {
+        notifyReady()
+    }
+
+    // Covers the watch app being installed while the phone app is already running.
+    nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
+        notifyReady()
+    }
+
+    private nonisolated func notifyReady() {
+        Task { @MainActor in
+            onReady?()
+        }
+    }
 
     nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
 

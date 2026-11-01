@@ -19,7 +19,6 @@ struct TimerMetrics {
     var verticalSpacing: CGFloat { isRegular ? 34 : 24 }
     var readoutSpacing: CGFloat { isRegular ? 22 : 18 }
     var titleSize: CGFloat { isRegular ? 64 : 50 }
-    var timeSize: CGFloat { isRegular ? 154 : 118 }
     var primaryButtonHeight: CGFloat { isRegular ? 72 : 54 }
     var resetButtonHeight: CGFloat { isRegular ? 60 : 48 }
     var settingsButtonSize: CGFloat { isRegular ? 52 : 44 }

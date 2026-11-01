@@ -52,6 +52,26 @@ struct TabataConfig: Codable, Equatable, Sendable {
     var presetName: String {
         "\(workSeconds)/\(restSeconds)/\(rounds)"
     }
+
+    // The last round has no rest after it: the workout ends as soon as the final work phase does.
+    var totalDuration: TimeInterval {
+        TimeInterval(rounds) * workDuration + TimeInterval(max(0, rounds - 1)) * restDuration
+    }
+
+    var roundsText: String {
+        "\(rounds) \(rounds == 1 ? "round" : "rounds")"
+    }
+}
+
+enum TabataClock {
+    static func text(seconds: Int) -> String {
+        String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    // A phase under a minute drops the "0:", so the digits can fill the screen.
+    static func compactText(seconds: Int) -> String {
+        seconds < 60 ? "\(seconds)" : text(seconds: seconds)
+    }
 }
 
 struct TabataPreset: Codable, Equatable, Identifiable, Sendable {
@@ -397,6 +417,27 @@ struct TabataState: Codable, Equatable, Sendable {
         return max(0, phaseDuration - now.timeIntervalSince(phaseStartedAt))
     }
 
+    // How much of the current phase is left, from 1 down to 0. Idle and finished screens stay full.
+    func phaseFraction(at now: Date) -> Double {
+        guard phase == .countdown || isWorkoutPhase, phaseDuration > 0 else {
+            return 1
+        }
+
+        return min(1, remaining(at: now) / phaseDuration)
+    }
+
+    var completedRounds: Int {
+        switch phase {
+        case .idle, .countdown:
+            0
+        case .work:
+            max(0, round - 1)
+        case .rest:
+            round
+        case .complete:
+            config.rounds
+        }
+    }
 }
 
 extension TabataState {
@@ -473,16 +514,21 @@ struct TabataPresentation: Equatable, Sendable {
     var primaryAction: TabataPrimaryAction
     var isPrimaryButtonProminent: Bool
     var showsReset: Bool
+    var resetButtonTitle: String
+    var nextText: String?
+    var spokenPhase: String?
 
     init(state: TabataState) {
         let isPaused = state.isWorkoutPhase && !state.isRunning
+        let config = state.config
 
-        showsReset = isPaused
+        showsReset = isPaused || state.phase == .complete
+        resetButtonTitle = state.phase == .complete ? "Home" : "Reset"
         isPrimaryButtonProminent = state.phase == .idle || state.phase == .complete || isPaused
 
         if state.phase == .complete {
-            primaryButtonTitle = "Back Home"
-            primaryAction = .reset
+            primaryButtonTitle = "Again"
+            primaryAction = .toggleRunning
         } else if state.phase == .countdown {
             primaryButtonTitle = "Cancel"
             primaryAction = .reset
@@ -496,17 +542,36 @@ struct TabataPresentation: Equatable, Sendable {
 
         switch state.phase {
         case .idle:
-            phoneRoundText = "\(state.config.rounds) rounds"
-            watchRoundText = "\(state.config.rounds) rounds"
+            phoneRoundText = config.roundsText
+            watchRoundText = config.roundsText
         case .countdown:
             phoneRoundText = "Get ready"
             watchRoundText = "Get ready"
         case .complete:
-            phoneRoundText = "Complete"
-            watchRoundText = "Complete"
+            let summary = "\(config.roundsText) · \(TabataClock.text(seconds: Int(config.totalDuration.rounded())))"
+            phoneRoundText = summary
+            watchRoundText = summary
         case .work, .rest:
             phoneRoundText = "Round \(state.round) of \(state.config.rounds)"
             watchRoundText = "\(state.round) / \(state.config.rounds)"
+        }
+
+        switch state.phase {
+        case .countdown:
+            nextText = "First up: Work \(config.workSeconds)s"
+            spokenPhase = "Get ready"
+        case .work:
+            nextText = state.round < config.rounds ? "Next: Rest \(config.restSeconds)s" : "Final round"
+            spokenPhase = "Work, round \(state.round) of \(config.rounds)"
+        case .rest:
+            nextText = "Next: Work \(config.workSeconds)s"
+            spokenPhase = "Rest, round \(state.round) of \(config.rounds)"
+        case .complete:
+            nextText = nil
+            spokenPhase = "Workout complete"
+        case .idle:
+            nextText = nil
+            spokenPhase = nil
         }
 
         if isPaused {
@@ -540,8 +605,8 @@ private extension TabataGradient {
         end: TabataColor(red: 0.18, green: 0.24, blue: 0.72)
     )
     static let work = TabataGradient(
-        start: TabataColor(red: 0.92, green: 0.48, blue: 0.12),
-        end: TabataColor(red: 0.70, green: 0.30, blue: 0.06)
+        start: TabataColor(red: 0.90, green: 0.30, blue: 0.06),
+        end: TabataColor(red: 0.72, green: 0.14, blue: 0.04)
     )
     static let countdown = TabataGradient(
         start: TabataColor(red: 0.12, green: 0.60, blue: 0.70),
@@ -602,6 +667,8 @@ struct TabataEngine {
     }
 
     mutating func pause(now: Date) {
+        advance(now: now)
+
         guard state.isWorkoutPhase, state.isRunning else {
             return
         }
@@ -622,6 +689,8 @@ struct TabataEngine {
     }
 
     mutating func toggleRunning(now: Date) {
+        advance(now: now)
+
         if state.phase == .idle || state.phase == .complete {
             start(now: now)
         } else if state.isRunning {
@@ -736,6 +805,107 @@ enum TabataCuePolicy {
 
         return oldState.phase != newState.phase || oldState.round != newState.round
     }
+
+    static func transitionCue(from oldState: TabataState, to newState: TabataState) -> TabataTransitionCue? {
+        guard needsTransitionCue(from: oldState, to: newState) else {
+            return nil
+        }
+
+        switch newState.phase {
+        case .work:
+            return .work
+        case .rest:
+            return .rest
+        case .complete:
+            return .finish
+        case .idle, .countdown:
+            return nil
+        }
+    }
+}
+
+// Each moment has its own cue, so the workout can be followed without looking at a screen.
+enum TabataTransitionCue: Sendable {
+    case work
+    case rest
+    case finish
+}
+
+// Sounds are synthesized rather than bundled, and the phone and the watch play the same ones.
+enum TabataTone {
+    struct Note: Sendable {
+        var frequency: Double
+        var duration: Double
+    }
+
+    static let tick = [Note(frequency: 880, duration: 0.09)]
+    static let work = [Note(frequency: 659, duration: 0.11), Note(frequency: 988, duration: 0.2)]
+    static let rest = [Note(frequency: 784, duration: 0.11), Note(frequency: 523, duration: 0.2)]
+    static let finish = [
+        Note(frequency: 523, duration: 0.12),
+        Note(frequency: 659, duration: 0.12),
+        Note(frequency: 784, duration: 0.12),
+        Note(frequency: 1047, duration: 0.42)
+    ]
+    static let silence = [Note(frequency: 0, duration: 1)]
+
+    static func notes(for cue: TabataTransitionCue) -> [Note] {
+        switch cue {
+        case .work:
+            work
+        case .rest:
+            rest
+        case .finish:
+            finish
+        }
+    }
+
+    static func waveData(_ notes: [Note], amplitude: Double = 0.5) -> Data {
+        let sampleRate = 22_050
+        var samples: [Int16] = []
+
+        for note in notes {
+            let sampleCount = Int(note.duration * Double(sampleRate))
+            for sampleIndex in 0..<sampleCount {
+                let position = Double(sampleIndex) / Double(sampleRate)
+                // A quick attack and a longer decay keep notes from clicking, and the octave gives a
+                // small phone speaker something it can project in a noisy gym.
+                let attack = min(1, Double(sampleIndex) / 110)
+                let decay = min(1, Double(sampleCount - sampleIndex) / Double(sampleCount) * 3)
+                let wave = sin(2 * .pi * note.frequency * position) * 0.8 + sin(4 * .pi * note.frequency * position) * 0.2
+                samples.append(Int16(wave * Double(Int16.max) * amplitude * attack * decay))
+            }
+        }
+
+        let byteCount = samples.count * MemoryLayout<Int16>.size
+        var data = Data()
+        append("RIFF", to: &data)
+        append(UInt32(36 + byteCount).littleEndian, to: &data)
+        append("WAVE", to: &data)
+        append("fmt ", to: &data)
+        append(UInt32(16).littleEndian, to: &data)
+        append(UInt16(1).littleEndian, to: &data)
+        append(UInt16(1).littleEndian, to: &data)
+        append(UInt32(sampleRate).littleEndian, to: &data)
+        append(UInt32(sampleRate * MemoryLayout<Int16>.size).littleEndian, to: &data)
+        append(UInt16(MemoryLayout<Int16>.size).littleEndian, to: &data)
+        append(UInt16(16).littleEndian, to: &data)
+        append("data", to: &data)
+        append(UInt32(byteCount).littleEndian, to: &data)
+        samples.forEach { append($0.littleEndian, to: &data) }
+        return data
+    }
+
+    private static func append(_ string: String, to data: inout Data) {
+        data.append(contentsOf: string.utf8)
+    }
+
+    private static func append<T>(_ value: T, to data: inout Data) {
+        var value = value
+        withUnsafeBytes(of: &value) { bytes in
+            data.append(contentsOf: bytes)
+        }
+    }
 }
 
 enum WatchCommand: String, Codable, Sendable {
@@ -751,11 +921,25 @@ struct WatchCommandPayload: Codable, Sendable {
     var command: WatchCommand
     var soundsEnabled: Bool?
     var presetID: String?
+    var issuedAt: Date?
 
-    init(command: WatchCommand, soundsEnabled: Bool? = nil, presetID: String? = nil) {
+    // Commands queue up while the phone is out of reach, and one replayed later would act on a
+    // workout it was never meant for. A watch build that sends no timestamp is taken at its word.
+    static let maxAge: TimeInterval = 10
+
+    init(command: WatchCommand, soundsEnabled: Bool? = nil, presetID: String? = nil, issuedAt: Date? = Date()) {
         self.command = command
         self.soundsEnabled = soundsEnabled
         self.presetID = presetID
+        self.issuedAt = issuedAt
+    }
+
+    func isFresh(at now: Date) -> Bool {
+        guard let issuedAt else {
+            return true
+        }
+
+        return now.timeIntervalSince(issuedAt) <= Self.maxAge
     }
 }
 
@@ -763,6 +947,7 @@ extension TabataState {
     private enum SyncKey {
         static let presets = "syncPresets"
         static let selectedPresetID = "syncSelectedPresetID"
+        static let revision = "syncRevision"
     }
 
     func payloadDictionary() -> [String: Any] {
@@ -771,8 +956,9 @@ extension TabataState {
 
     // The catalog rides in the same dictionary as the state rather than replacing it, so a watch
     // build that only knows about the state keys keeps mirroring a newer phone.
-    func payloadDictionary(catalog: TabataPresetCatalog) -> [String: Any] {
+    func payloadDictionary(catalog: TabataPresetCatalog, revision: TimeInterval = Date().timeIntervalSince1970) -> [String: Any] {
         var dictionary = payloadDictionary()
+        dictionary[SyncKey.revision] = revision
         dictionary[SyncKey.presets] = CodablePayload.array(from: catalog.presets)
         dictionary[SyncKey.selectedPresetID] = catalog.selectedID
         return dictionary
@@ -780,6 +966,12 @@ extension TabataState {
 
     static func fromPayloadDictionary(_ dictionary: [String: Any]) -> TabataState? {
         CodablePayload.value(TabataState.self, from: dictionary)
+    }
+
+    // Every publish goes out twice, as a message and as the application context, and the two can
+    // arrive in either order, so the watch uses this to ignore anything older than it has seen.
+    static func revisionFromPayloadDictionary(_ dictionary: [String: Any]) -> TimeInterval? {
+        dictionary[SyncKey.revision] as? TimeInterval
     }
 
     static func catalogFromPayloadDictionary(_ dictionary: [String: Any]) -> TabataPresetCatalog? {

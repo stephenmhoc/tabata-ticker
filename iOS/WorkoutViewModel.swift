@@ -85,9 +85,14 @@ final class WorkoutViewModel {
         connectivity.onCommand = { [weak self] command in
             self?.handle(command)
         }
+        // Activation finishes after this returns, and nothing can be sent until it has.
+        connectivity.onReady = { [weak self] in
+            self?.publishState()
+        }
         connectivity.activate()
         publishState()
         syncRunningState()
+        TabataShortcuts.updateAppShortcutParameters()
     }
 
     func tick(now: Date = Date()) {
@@ -95,9 +100,12 @@ final class WorkoutViewModel {
         self.now = now
         state = engine.tick(now: now)
 
-        if state.settings.soundsEnabled, TabataCuePolicy.needsTransitionCue(from: oldState, to: state) {
-            cuePerformer.playTransition()
-            lastCountdownCue = nil
+        if let cue = TabataCuePolicy.transitionCue(from: oldState, to: state) {
+            if state.settings.soundsEnabled {
+                cuePerformer.playTransition(cue)
+            }
+            // Counts this second as cued, so a short phase never plays two sounds at once.
+            lastCountdownCue = TabataCuePolicy.countdownCue(in: state, now: now)
         }
 
         if state.settings.soundsEnabled, let cue = TabataCuePolicy.countdownCue(in: state, now: now), cue != lastCountdownCue {
@@ -117,6 +125,7 @@ final class WorkoutViewModel {
         self.now = now
         engine.toggleRunning(now: now)
         state = engine.state
+        lastCountdownCue = TabataCuePolicy.countdownCue(in: state, now: now)
         syncRunningState()
         publishState()
     }
@@ -153,6 +162,7 @@ final class WorkoutViewModel {
         }
 
         presetStore.save(presetCatalog)
+        TabataShortcuts.updateAppShortcutParameters()
         resetToSelectedPreset()
         return true
     }
@@ -165,8 +175,11 @@ final class WorkoutViewModel {
         }
 
         presetStore.save(presetCatalog)
+        TabataShortcuts.updateAppShortcutParameters()
         if wasSelected, state.phase == .idle || state.phase == .complete {
             resetToSelectedPreset()
+        } else {
+            publishState()
         }
         return true
     }
@@ -179,8 +192,11 @@ final class WorkoutViewModel {
         }
 
         presetStore.save(presetCatalog)
+        TabataShortcuts.updateAppShortcutParameters()
         if wasSelected, state.phase == .idle || state.phase == .complete {
             resetToSelectedPreset()
+        } else {
+            publishState()
         }
         return true
     }
@@ -203,6 +219,12 @@ final class WorkoutViewModel {
     }
 
     private func handle(_ payload: WatchCommandPayload) {
+        guard payload.isFresh(at: Date()) else {
+            // The watch acted on this alone, so it needs telling what is really happening.
+            publishState()
+            return
+        }
+
         switch payload.command {
         case .start:
             start()
@@ -309,7 +331,8 @@ final class WorkoutViewModel {
         now = Date()
         engine.resume(now: now)
         state = engine.state
-        lastCountdownCue = nil
+        // The second a pause landed in has already been cued.
+        lastCountdownCue = TabataCuePolicy.countdownCue(in: state, now: now)
         syncRunningState()
         publishState()
     }
@@ -319,36 +342,84 @@ final class WorkoutViewModel {
 private final class PhoneCuePerformer {
     private static let duckReleaseDelay: TimeInterval = 1.5
 
-    private let countdownPlayer: AVAudioPlayer?
-    private let transitionPlayer: AVAudioPlayer?
-    private let keepAlivePlayer: AVAudioPlayer?
+    private var players = Players()
     private var duckRelease: Task<Void, Never>?
     private var isWorkoutAudioActive = false
     private var didReportSessionFailure = false
 
+    @MainActor
+    private struct Players {
+        let countdown = PhoneCuePerformer.makePlayer(TabataTone.tick)
+        let work = PhoneCuePerformer.makePlayer(TabataTone.work)
+        let rest = PhoneCuePerformer.makePlayer(TabataTone.rest)
+        let finish = PhoneCuePerformer.makePlayer(TabataTone.finish)
+        let keepAlive: AVAudioPlayer? = {
+            let player = PhoneCuePerformer.makePlayer(TabataTone.silence, amplitude: 0)
+            player?.numberOfLoops = -1
+            return player
+        }()
+
+        var isComplete: Bool {
+            countdown != nil && work != nil && rest != nil && finish != nil && keepAlive != nil
+        }
+    }
+
     init() {
         // The category has to be in place before anything touches the audio hardware: the default
         // .soloAmbient category stops whatever the user is already listening to.
+        Self.configureSession()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+
+        if !players.isComplete {
+            TabataDiagnostics.report("Workout cue audio could not be prepared")
+        }
+
+        // The tick alone cannot recover from these: without the keep-alive audio iOS may suspend the
+        // app, and then the tick never comes.
+        let center = NotificationCenter.default
+        center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] notification in
+            let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            guard type == AVAudioSession.InterruptionType.ended.rawValue else {
+                return
+            }
+
+            MainActor.assumeIsolated {
+                self?.resumeKeepAlive()
+            }
+        }
+        center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.rebuildAudio()
+            }
+        }
+    }
+
+    private static func configureSession() {
         do {
             try AVAudioSession.sharedInstance().setCategory(
                 .playback,
                 mode: .default,
-                options: Self.categoryOptions(ducksOthers: false)
+                options: categoryOptions(ducksOthers: false)
             )
         } catch {
             TabataDiagnostics.report("Configuring the audio session failed", error: error)
         }
+    }
 
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-
-        countdownPlayer = Self.makePlayer(frequency: 880, duration: 0.08)
-        transitionPlayer = Self.makePlayer(frequency: 1320, duration: 0.16)
-        keepAlivePlayer = Self.makePlayer(frequency: 0, duration: 1, amplitude: 0)
-        keepAlivePlayer?.numberOfLoops = -1
-
-        if countdownPlayer == nil || transitionPlayer == nil || keepAlivePlayer == nil {
-            TabataDiagnostics.report("Workout cue audio could not be prepared")
+    private func resumeKeepAlive() {
+        guard isWorkoutAudioActive else {
+            return
         }
+
+        activateSession()
+        players.keepAlive?.play()
+    }
+
+    // After a media services reset every existing player and the session's setup are dead.
+    private func rebuildAudio() {
+        Self.configureSession()
+        players = Players()
+        resumeKeepAlive()
     }
 
     // A running workout plays silence so iOS keeps the app alive with the screen off. This is called
@@ -362,7 +433,7 @@ private final class PhoneCuePerformer {
             return
         }
 
-        guard let keepAlivePlayer, !keepAlivePlayer.isPlaying else {
+        guard let keepAlivePlayer = players.keepAlive, !keepAlivePlayer.isPlaying else {
             return
         }
 
@@ -371,11 +442,18 @@ private final class PhoneCuePerformer {
     }
 
     func playCountdown() {
-        play(countdownPlayer)
+        play(players.countdown)
     }
 
-    func playTransition() {
-        play(transitionPlayer)
+    func playTransition(_ cue: TabataTransitionCue) {
+        switch cue {
+        case .work:
+            play(players.work)
+        case .rest:
+            play(players.rest)
+        case .finish:
+            play(players.finish)
+        }
     }
 
     private func play(_ player: AVAudioPlayer?) {
@@ -413,7 +491,7 @@ private final class PhoneCuePerformer {
             return
         }
 
-        keepAlivePlayer?.stop()
+        players.keepAlive?.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
@@ -451,52 +529,7 @@ private final class PhoneCuePerformer {
         ducksOthers ? [.mixWithOthers, .duckOthers] : [.mixWithOthers]
     }
 
-    private static func makePlayer(frequency: Double, duration: Double, amplitude: Double = 0.25) -> AVAudioPlayer? {
-        guard let data = toneData(frequency: frequency, duration: duration, amplitude: amplitude) else {
-            return nil
-        }
-
-        return try? AVAudioPlayer(data: data)
-    }
-
-    private static func toneData(frequency: Double, duration: Double, amplitude: Double) -> Data? {
-        let sampleRate = 22_050
-        let sampleCount = Int(duration * Double(sampleRate))
-        let byteCount = sampleCount * MemoryLayout<Int16>.size
-        var data = Data()
-
-        append("RIFF", to: &data)
-        append(UInt32(36 + byteCount).littleEndian, to: &data)
-        append("WAVE", to: &data)
-        append("fmt ", to: &data)
-        append(UInt32(16).littleEndian, to: &data)
-        append(UInt16(1).littleEndian, to: &data)
-        append(UInt16(1).littleEndian, to: &data)
-        append(UInt32(sampleRate).littleEndian, to: &data)
-        append(UInt32(sampleRate * MemoryLayout<Int16>.size).littleEndian, to: &data)
-        append(UInt16(MemoryLayout<Int16>.size).littleEndian, to: &data)
-        append(UInt16(16).littleEndian, to: &data)
-        append("data", to: &data)
-        append(UInt32(byteCount).littleEndian, to: &data)
-
-        for sampleIndex in 0..<sampleCount {
-            let position = Double(sampleIndex) / Double(sampleRate)
-            let envelope = min(1, Double(sampleCount - sampleIndex) / Double(sampleCount) * 4)
-            let value = sin(2 * Double.pi * frequency * position) * Double(Int16.max) * amplitude * envelope
-            append(Int16(value).littleEndian, to: &data)
-        }
-
-        return data
-    }
-
-    private static func append(_ string: String, to data: inout Data) {
-        data.append(contentsOf: string.utf8)
-    }
-
-    private static func append<T>(_ value: T, to data: inout Data) {
-        var value = value
-        withUnsafeBytes(of: &value) { bytes in
-            data.append(contentsOf: bytes)
-        }
+    private static func makePlayer(_ notes: [TabataTone.Note], amplitude: Double = 0.5) -> AVAudioPlayer? {
+        try? AVAudioPlayer(data: TabataTone.waveData(notes, amplitude: amplitude))
     }
 }

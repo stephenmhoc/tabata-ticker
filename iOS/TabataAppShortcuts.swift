@@ -37,7 +37,9 @@ struct TabataPresetQuery: EntityStringQuery {
     }
 }
 
-struct StartWorkoutIntent: AppIntent {
+// Starting from the background needs both conformances: iOS only allows a Live Activity request
+// from a LiveActivityIntent, and only allows the keep-alive audio from an AudioPlaybackIntent.
+struct StartWorkoutIntent: LiveActivityIntent, AudioPlaybackIntent {
     static let title: LocalizedStringResource = "Start Workout"
     static let description = IntentDescription("Starts a workout, using the selected preset unless another is named.")
     static let openAppWhenRun = false
@@ -96,7 +98,7 @@ struct PauseWorkoutIntent: AppIntent {
     }
 }
 
-struct ResumeWorkoutIntent: AppIntent {
+struct ResumeWorkoutIntent: LiveActivityIntent, AudioPlaybackIntent {
     static let title: LocalizedStringResource = "Resume Workout"
     static let description = IntentDescription("Resumes a paused workout.")
     static let openAppWhenRun = false

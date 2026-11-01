@@ -39,6 +39,7 @@ private enum ContentRoute: Hashable {
 
 struct ContentView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private let viewModel: WorkoutViewModel
     @State private var path: [ContentRoute] = []
 
@@ -51,21 +52,54 @@ struct ContentView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ZStack {
-                LinearGradient(colors: backgroundColors, startPoint: .topLeading, endPoint: .bottomTrailing)
-                    .ignoresSafeArea()
+                phaseBackdrop
 
-                VStack(spacing: metrics.verticalSpacing) {
-                    header
+                // Follows the space the window really has, so iPad landscape, Split View and Stage
+                // Manager each get a layout that fills them.
+                GeometryReader { proxy in
+                    let isWide = proxy.size.width > proxy.size.height * 1.15
 
-                    readout
+                    VStack(spacing: metrics.verticalSpacing) {
+                        if showsHeader {
+                            header
+                        }
 
-                    Spacer(minLength: 18)
+                        if isWide {
+                            HStack(spacing: metrics.verticalSpacing) {
+                                clock(in: CGSize(width: proxy.size.width * 0.58, height: proxy.size.height))
 
-                    controls
+                                VStack(spacing: metrics.readoutSpacing) {
+                                    title
+                                    roundDetails
+                                    Spacer(minLength: 0)
+                                    controls
+                                }
+                            }
+                            .frame(maxHeight: .infinity)
+                        } else {
+                            VStack(spacing: metrics.readoutSpacing) {
+                                title
+                                clock(in: proxy.size)
+                                roundDetails
+                            }
+
+                            Spacer(minLength: 18)
+
+                            controls
+                        }
+                    }
                 }
-                .frame(maxWidth: metrics.contentMaxWidth)
                 .padding(.horizontal, metrics.horizontalPadding)
                 .padding(.vertical, metrics.verticalPadding)
+                .animation(reduceMotion ? nil : .smooth(duration: 0.35), value: viewModel.state.phase)
+            }
+            .sensoryFeedback(trigger: phaseKey) { _, _ in
+                transitionFeedback
+            }
+            .onChange(of: presentation.spokenPhase) { _, spokenPhase in
+                if let spokenPhase {
+                    AccessibilityNotification.Announcement(spokenPhase).post()
+                }
             }
             .toolbarBackground(.hidden, for: .navigationBar)
             .navigationDestination(for: ContentRoute.self) { route in
@@ -76,6 +110,51 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .onAppear {
             viewModel.activate()
+        }
+    }
+
+    // The phase's colour drains away as its time runs out, so how long is left reads from across
+    // the room without seeing a digit. Reduce Motion keeps the screen full.
+    private var phaseBackdrop: some View {
+        let fraction = reduceMotion ? 1 : viewModel.state.phaseFraction(at: viewModel.now)
+        let gradient = LinearGradient(colors: backgroundColors, startPoint: .topLeading, endPoint: .bottomTrailing)
+
+        return ZStack {
+            gradient
+                .overlay(.black.opacity(0.42))
+
+            gradient
+                .mask(alignment: .bottom) {
+                    GeometryReader { proxy in
+                        Rectangle()
+                            .frame(height: proxy.size.height * fraction)
+                            .frame(maxHeight: .infinity, alignment: .bottom)
+                    }
+                }
+                .animation(.linear(duration: 0.25), value: fraction)
+        }
+        .animation(.smooth(duration: 0.35), value: presentation.title)
+        .ignoresSafeArea()
+    }
+
+    private var phaseKey: String {
+        "\(viewModel.state.phase.rawValue)-\(viewModel.state.round)"
+    }
+
+    private var transitionFeedback: SensoryFeedback? {
+        guard viewModel.state.settings.hapticsEnabled else {
+            return nil
+        }
+
+        switch viewModel.state.phase {
+        case .work:
+            return .impact(weight: .heavy)
+        case .rest:
+            return .impact(weight: .light)
+        case .complete:
+            return .success
+        case .idle, .countdown:
+            return nil
         }
     }
 
@@ -162,6 +241,11 @@ struct ContentView: View {
         .toolbarBackground(.hidden, for: .navigationBar)
     }
 
+    // A running workout shows nothing that can't be used mid-exercise.
+    private var showsHeader: Bool {
+        !viewModel.state.isRunning
+    }
+
     private var header: some View {
         HStack {
             if viewModel.state.phase == .idle {
@@ -226,36 +310,88 @@ struct ContentView: View {
         .accessibilityValue(viewModel.selectedPreset.name)
     }
 
-    private var readout: some View {
-        VStack(spacing: metrics.readoutSpacing) {
-            Text(presentation.title)
-                .font(.system(size: metrics.titleSize, weight: .black, design: .rounded))
-                .foregroundStyle(.white)
-                .minimumScaleFactor(0.6)
+    private var title: some View {
+        Text(presentation.title)
+            .font(.system(size: metrics.titleSize, weight: .black, design: .rounded))
+            .foregroundStyle(.white)
+            .minimumScaleFactor(0.6)
+            .contentTransition(.opacity)
+            .accessibilityHidden(true)
+    }
 
-            Text(timeText)
-                .font(.system(size: metrics.timeSize, weight: .black, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.white)
-                .minimumScaleFactor(0.45)
-                .lineLimit(1)
+    @ViewBuilder
+    private func clock(in size: CGSize) -> some View {
+        // Sized for two digits, with the height fixed, so nothing moves when the count reaches 9.
+        let fontSize = min(size.width * 0.76, size.height * 0.46)
 
+        Group {
+            if viewModel.state.phase == .complete {
+                Image(systemName: "checkmark")
+                    .font(.system(size: fontSize * 0.7, weight: .black, design: .rounded))
+                    .symbolEffect(.bounce, value: viewModel.state.phase)
+                    .transition(.scale(scale: 0.4).combined(with: .opacity))
+            } else {
+                Text(timeText)
+                    .font(.system(size: fontSize, weight: .black, design: .rounded))
+                    .monospacedDigit()
+                    .minimumScaleFactor(0.3)
+                    .lineLimit(1)
+                    .contentTransition(reduceMotion ? .identity : .numericText(countsDown: true))
+                    .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: timeText)
+            }
+        }
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity)
+        .frame(height: fontSize * 0.86)
+        .keyframeAnimator(initialValue: 1.0, trigger: finalSecondsPulse) { content, scale in
+            content.scaleEffect(scale)
+        } keyframes: { _ in
+            KeyframeTrack {
+                SpringKeyframe(pulsePeak, duration: 0.12)
+                SpringKeyframe(1.0, duration: 0.3)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.title)
+        .accessibilityValue("\(remainingSeconds) seconds, \(presentation.phoneRoundText)")
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private var roundDetails: some View {
+        VStack(spacing: 12) {
             Text(presentation.phoneRoundText)
                 .font(metrics.roundFont)
-                .foregroundStyle(.white.opacity(0.86))
+                .foregroundStyle(.white.opacity(0.9))
+                .monospacedDigit()
+
+            RoundPips(
+                total: viewModel.state.config.rounds,
+                completed: viewModel.state.completedRounds,
+                isOnRound: viewModel.state.phase == .work
+            )
+            .frame(maxWidth: metrics.controlsMaxWidth)
+
+            if let nextText = presentation.nextText {
+                Text(nextText)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .contentTransition(.opacity)
+            }
         }
         .frame(maxWidth: .infinity)
+        .accessibilityHidden(true)
     }
 
     private var controls: some View {
         VStack(spacing: 12) {
             primaryActionButton
+                .keyboardShortcut(.space, modifiers: [])
 
             if presentation.showsReset {
                 Button {
                     viewModel.reset()
                 } label: {
-                    Text("Reset")
+                    Text(presentation.resetButtonTitle)
                         .frame(maxWidth: .infinity, minHeight: metrics.resetButtonHeight)
                 }
                 .buttonStyle(.glassProminent)
@@ -324,13 +460,30 @@ struct ContentView: View {
         TabataPresentation(state: viewModel.state)
     }
 
-    private var timeText: String {
-        let remaining = Int(ceil(viewModel.state.remaining(at: viewModel.now)))
-        return Self.timeText(for: max(0, remaining))
+    private var remainingSeconds: Int {
+        max(0, Int(ceil(viewModel.state.remaining(at: viewModel.now))))
     }
 
-    private static func timeText(for seconds: Int) -> String {
-        String(format: "%d:%02d", seconds / 60, seconds % 60)
+    // The home screen says how long the whole workout takes; after that it's the current phase.
+    private var timeText: String {
+        if viewModel.state.phase == .idle {
+            return TabataClock.text(seconds: Int(viewModel.state.config.totalDuration.rounded()))
+        }
+
+        return TabataClock.compactText(seconds: remainingSeconds)
+    }
+
+    private var pulsePeak: Double {
+        finalSecondsPulse == nil || reduceMotion ? 1.0 : 1.12
+    }
+
+    // Each of the last three seconds of a phase gives the digits a beat.
+    private var finalSecondsPulse: Int? {
+        guard viewModel.state.isRunning, (1...3).contains(remainingSeconds) else {
+            return nil
+        }
+
+        return remainingSeconds
     }
 
     private var backgroundColors: [Color] {
@@ -339,5 +492,30 @@ struct ContentView: View {
 
     private var resumeButtonTint: Color {
         Color(red: 0.00, green: 0.48, blue: 0.95)
+    }
+}
+
+private struct RoundPips: View {
+    let total: Int
+    let completed: Int
+    let isOnRound: Bool
+
+    var body: some View {
+        HStack(spacing: total > 16 ? 3 : 6) {
+            ForEach(0..<total, id: \.self) { index in
+                Capsule()
+                    .fill(.white.opacity(opacity(for: index)))
+                    .frame(height: 8)
+            }
+        }
+        .animation(.smooth(duration: 0.3), value: completed)
+    }
+
+    private func opacity(for index: Int) -> Double {
+        if index < completed {
+            return 1
+        }
+
+        return index == completed && isOnRound ? 0.6 : 0.22
     }
 }

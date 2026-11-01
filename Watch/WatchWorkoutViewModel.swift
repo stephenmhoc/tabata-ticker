@@ -67,6 +67,9 @@ final class WatchWorkoutViewModel {
             return
         }
 
+        // Start may be tapped before the phone answers, so the timer has to match the label now.
+        engine = TabataEngine(state: .idle(config: preset.config, settings: state.settings))
+        state = engine.state
         connectivity.send(WatchCommandPayload(command: .selectPreset, soundsEnabled: nil, presetID: preset.id))
     }
 
@@ -75,10 +78,7 @@ final class WatchWorkoutViewModel {
         self.now = now
         state = engine.tick(now: now)
 
-        if TabataCuePolicy.needsTransitionCue(from: oldState, to: state) {
-            cuePerformer.playTransition(soundsEnabled: state.settings.soundsEnabled, hapticsEnabled: state.settings.hapticsEnabled)
-            lastCountdownCue = nil
-        }
+        playTransitionCue(from: oldState)
 
         if let cue = TabataCuePolicy.countdownCue(in: state, now: now), cue != lastCountdownCue {
             cuePerformer.playCountdown(soundsEnabled: state.settings.soundsEnabled, hapticsEnabled: state.settings.hapticsEnabled)
@@ -93,7 +93,8 @@ final class WatchWorkoutViewModel {
         now = Date()
         engine.toggleRunning(now: now)
         state = engine.state
-        lastCountdownCue = nil
+        // The second a pause landed in has already been cued.
+        lastCountdownCue = TabataCuePolicy.countdownCue(in: state, now: now)
         syncRunningState()
         connectivity.send(WatchCommandPayload(command: command, soundsEnabled: nil))
     }
@@ -117,13 +118,37 @@ final class WatchWorkoutViewModel {
         connectivity.send(WatchCommandPayload(command: .setSoundsEnabled, soundsEnabled: enabled))
     }
 
+    // The phone's update can beat the next local tick to a phase boundary, so a transition is cued
+    // here as well as in tick. Whichever sees it first moves the state on, so it only plays once.
+    // Only a running timer cues: state cached from an old workout must not buzz at launch.
     private func receive(_ newState: TabataState) {
+        let oldState = state
         now = Date()
         settingsStore.save(newState.settings)
-        state = newState
         engine = TabataEngine(state: newState)
-        lastCountdownCue = nil
+        state = engine.tick(now: now)
+
+        if oldState.isRunning {
+            playTransitionCue(from: oldState)
+        }
+
         syncRunningState()
+    }
+
+    private func playTransitionCue(from oldState: TabataState) {
+        guard let cue = TabataCuePolicy.transitionCue(from: oldState, to: state) else {
+            return
+        }
+
+        cuePerformer.playTransition(cue, soundsEnabled: state.settings.soundsEnabled, hapticsEnabled: state.settings.hapticsEnabled)
+        // Counts this second as cued, so a short phase never plays two cues at once.
+        lastCountdownCue = TabataCuePolicy.countdownCue(in: state, now: now)
+    }
+
+    // A runtime session can only start while the app is frontmost, so one that could not start
+    // earlier gets its chance when the user raises their wrist.
+    func sceneBecameActive() {
+        runtimeSessionController.setRunning(state.isRunning)
     }
 
     private var nextRunningCommand: WatchCommand {
@@ -185,7 +210,9 @@ private final class WatchRuntimeSessionController: NSObject, WKExtendedRuntimeSe
     }
 
     private func start() {
-        guard session == nil else {
+        // Every path here is on the main thread, including the delayed restart below.
+        let isActive = MainActor.assumeIsolated { WKApplication.shared().applicationState == .active }
+        guard session == nil, isActive else {
             return
         }
 
@@ -238,15 +265,19 @@ private final class WatchRuntimeSessionController: NSObject, WKExtendedRuntimeSe
 
 private final class WatchCuePerformer {
     private let countdownPlayer: AVAudioPlayer?
-    private let transitionPlayer: AVAudioPlayer?
+    private let workPlayer: AVAudioPlayer?
+    private let restPlayer: AVAudioPlayer?
+    private let finishPlayer: AVAudioPlayer?
 
     init() {
         // The category has to be in place before anything touches the audio hardware: the default
         // .soloAmbient category stops whatever the user is already listening to.
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
 
-        countdownPlayer = Self.makePlayer(frequency: 880, duration: 0.08)
-        transitionPlayer = Self.makePlayer(frequency: 1320, duration: 0.16)
+        countdownPlayer = Self.makePlayer(TabataTone.tick)
+        workPlayer = Self.makePlayer(TabataTone.work)
+        restPlayer = Self.makePlayer(TabataTone.rest)
+        finishPlayer = Self.makePlayer(TabataTone.finish)
     }
 
     func playCountdown(soundsEnabled: Bool, hapticsEnabled: Bool) {
@@ -254,25 +285,37 @@ private final class WatchCuePerformer {
             play(countdownPlayer)
         }
         if hapticsEnabled {
-            WKInterfaceDevice.current().play(.click)
+            WKInterfaceDevice.current().play(.directionUp)
         }
     }
 
-    func playTransition(soundsEnabled: Bool, hapticsEnabled: Bool) {
+    // WORK, REST and the finish each feel different, so the wrist alone says what comes next.
+    func playTransition(_ cue: TabataTransitionCue, soundsEnabled: Bool, hapticsEnabled: Bool) {
+        let player: AVAudioPlayer?
+        let haptic: WKHapticType
+
+        switch cue {
+        case .work:
+            player = workPlayer
+            haptic = .start
+        case .rest:
+            player = restPlayer
+            haptic = .stop
+        case .finish:
+            player = finishPlayer
+            haptic = .success
+        }
+
         if soundsEnabled {
-            play(transitionPlayer)
+            play(player)
         }
         if hapticsEnabled {
-            WKInterfaceDevice.current().play(.notification)
+            WKInterfaceDevice.current().play(haptic)
         }
     }
 
-    private static func makePlayer(frequency: Double, duration: Double) -> AVAudioPlayer? {
-        guard let data = toneData(frequency: frequency, duration: duration) else {
-            return nil
-        }
-
-        let player = try? AVAudioPlayer(data: data)
+    private static func makePlayer(_ notes: [TabataTone.Note]) -> AVAudioPlayer? {
+        let player = try? AVAudioPlayer(data: TabataTone.waveData(notes))
         player?.prepareToPlay()
         return player
     }
@@ -280,46 +323,5 @@ private final class WatchCuePerformer {
     private func play(_ player: AVAudioPlayer?) {
         player?.currentTime = 0
         player?.play()
-    }
-
-    private static func toneData(frequency: Double, duration: Double) -> Data? {
-        let sampleRate = 22_050
-        let sampleCount = Int(duration * Double(sampleRate))
-        let byteCount = sampleCount * MemoryLayout<Int16>.size
-        var data = Data()
-
-        append("RIFF", to: &data)
-        append(UInt32(36 + byteCount).littleEndian, to: &data)
-        append("WAVE", to: &data)
-        append("fmt ", to: &data)
-        append(UInt32(16).littleEndian, to: &data)
-        append(UInt16(1).littleEndian, to: &data)
-        append(UInt16(1).littleEndian, to: &data)
-        append(UInt32(sampleRate).littleEndian, to: &data)
-        append(UInt32(sampleRate * MemoryLayout<Int16>.size).littleEndian, to: &data)
-        append(UInt16(MemoryLayout<Int16>.size).littleEndian, to: &data)
-        append(UInt16(16).littleEndian, to: &data)
-        append("data", to: &data)
-        append(UInt32(byteCount).littleEndian, to: &data)
-
-        for sampleIndex in 0..<sampleCount {
-            let position = Double(sampleIndex) / Double(sampleRate)
-            let envelope = min(1, Double(sampleCount - sampleIndex) / Double(sampleCount) * 4)
-            let value = sin(2 * Double.pi * frequency * position) * Double(Int16.max) * 0.25 * envelope
-            append(Int16(value).littleEndian, to: &data)
-        }
-
-        return data
-    }
-
-    private static func append(_ string: String, to data: inout Data) {
-        data.append(contentsOf: string.utf8)
-    }
-
-    private static func append<T>(_ value: T, to data: inout Data) {
-        var value = value
-        withUnsafeBytes(of: &value) { bytes in
-            data.append(contentsOf: bytes)
-        }
     }
 }

@@ -5,6 +5,7 @@ import WatchConnectivity
 final class WatchConnectivity: NSObject, WCSessionDelegate {
     var onState: ((TabataState) -> Void)?
     var onCatalog: ((TabataPresetCatalog) -> Void)?
+    private var lastRevision: TimeInterval = 0
 
     func activate() {
         guard WCSession.isSupported() else {
@@ -22,9 +23,12 @@ final class WatchConnectivity: NSObject, WCSessionDelegate {
             return
         }
 
-        let payload = command.payloadDictionary()
-        let session = WCSession.default
+        Self.deliver(command.payloadDictionary(), over: WCSession.default)
+    }
 
+    // Nonisolated because WatchConnectivity calls the error handler on its own queue, and a closure
+    // written on the main actor would trap there.
+    private nonisolated static func deliver(_ payload: [String: Any], over session: WCSession) {
         if session.isReachable {
             session.sendMessage(payload, replyHandler: nil) { _ in
                 session.transferUserInfo(payload)
@@ -55,9 +59,10 @@ final class WatchConnectivity: NSObject, WCSessionDelegate {
         }
 
         let catalog = TabataState.catalogFromPayloadDictionary(dictionary)
+        let revision = TabataState.revisionFromPayloadDictionary(dictionary)
 
         Task { @MainActor in
-            apply(state: state, catalog: catalog)
+            apply(state: state, catalog: catalog, revision: revision)
         }
     }
 
@@ -66,11 +71,23 @@ final class WatchConnectivity: NSObject, WCSessionDelegate {
             return
         }
 
-        apply(state: state, catalog: TabataState.catalogFromPayloadDictionary(dictionary))
+        apply(
+            state: state,
+            catalog: TabataState.catalogFromPayloadDictionary(dictionary),
+            revision: TabataState.revisionFromPayloadDictionary(dictionary)
+        )
     }
 
     // A phone that predates preset syncing sends the state on its own, so the catalog is optional.
-    private func apply(state: TabataState, catalog: TabataPresetCatalog?) {
+    private func apply(state: TabataState, catalog: TabataPresetCatalog?, revision: TimeInterval?) {
+        if let revision {
+            guard revision >= lastRevision else {
+                return
+            }
+
+            lastRevision = revision
+        }
+
         onState?(state)
 
         if let catalog {

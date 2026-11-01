@@ -5,6 +5,8 @@ struct TabataLiveActivityAttributes: ActivityAttributes {
     struct ContentState: Codable, Hashable, Sendable {
         var title: String
         var roundText: String
+        var nextText: String?
+        var summaryText: String?
         var isRunning: Bool
         var phaseIconName: String
         var startsAt: Date

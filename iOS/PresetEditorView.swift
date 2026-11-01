@@ -41,93 +41,94 @@ struct PresetEditorView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 28) {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(title)
-                    .font(.system(.largeTitle, design: .rounded).weight(.black))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(title)
+                        .font(.system(.largeTitle, design: .rounded).weight(.black))
 
-                // Empty means the preset keeps showing its timings, so the field is optional rather
-                // than something to fill in before saving.
-                TextField("Name (optional)", text: $name)
-                    .font(.system(.title, design: .rounded).weight(.black))
-                    .textInputAutocapitalization(.words)
-                    .submitLabel(.done)
-                    .focused($isNamingPreset)
-                    .onSubmit {
-                        isNamingPreset = false
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .accessibilityLabel("Preset name")
+                    // Empty means the preset keeps showing its timings, so the field is optional rather
+                    // than something to fill in before saving.
+                    TextField("Name (optional)", text: $name)
+                        .font(.system(.title, design: .rounded).weight(.black))
+                        .textInputAutocapitalization(.words)
+                        .submitLabel(.done)
+                        .focused($isNamingPreset)
+                        .onSubmit {
+                            isNamingPreset = false
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .accessibilityLabel("Preset name")
 
-                Text(config.presetName)
-                    .font(.headline.weight(.semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(.white.opacity(0.7))
+                    Text("\(config.presetName) · \(TabataClock.text(seconds: Int(config.totalDuration.rounded()))) total")
+                        .font(.headline.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .foregroundStyle(.white)
+
+                VStack(spacing: 16) {
+                    PresetValueControl(
+                        title: "Work Time",
+                        value: "\(workSeconds) sec",
+                        decrementDisabled: workSeconds <= Self.workRange.lowerBound,
+                        incrementDisabled: workSeconds >= Self.workRange.upperBound,
+                        onDecrement: {
+                            adjustWork(by: -5)
+                        },
+                        onIncrement: {
+                            adjustWork(by: 5)
+                        }
+                    )
+
+                    PresetValueControl(
+                        title: "Rest Time",
+                        value: "\(restSeconds) sec",
+                        decrementDisabled: restSeconds <= Self.restRange.lowerBound,
+                        incrementDisabled: restSeconds >= Self.restRange.upperBound,
+                        onDecrement: {
+                            adjustRest(by: -5)
+                        },
+                        onIncrement: {
+                            adjustRest(by: 5)
+                        }
+                    )
+
+                    PresetValueControl(
+                        title: "Rounds",
+                        value: "\(rounds) \(rounds == 1 ? "round" : "rounds")",
+                        decrementDisabled: rounds <= Self.roundsRange.lowerBound,
+                        incrementDisabled: rounds >= Self.roundsRange.upperBound,
+                        onDecrement: {
+                            adjustRounds(by: -1)
+                        },
+                        onIncrement: {
+                            adjustRounds(by: 1)
+                        }
+                    )
+                }
+
+                if let validationText {
+                    Text(validationText)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.76))
+                }
+
+                Button {
+                    showsSaveError = !onSave(config, TabataPreset.sanitizedName(name))
+                } label: {
+                    Text(saveTitle)
+                        .frame(maxWidth: .infinity, minHeight: 54)
+                }
+                .buttonStyle(.glassProminent)
+                .foregroundStyle(.black)
+                .font(.headline.weight(.bold))
+                .disabled(!canSave)
             }
-            .foregroundStyle(.white)
-
-            VStack(spacing: 16) {
-                PresetValueControl(
-                    title: "Work Time",
-                    value: "\(workSeconds) sec",
-                    decrementDisabled: workSeconds <= Self.workRange.lowerBound,
-                    incrementDisabled: workSeconds >= Self.workRange.upperBound,
-                    onDecrement: {
-                        adjustWork(by: -5)
-                    },
-                    onIncrement: {
-                        adjustWork(by: 5)
-                    }
-                )
-
-                PresetValueControl(
-                    title: "Rest Time",
-                    value: "\(restSeconds) sec",
-                    decrementDisabled: restSeconds <= Self.restRange.lowerBound,
-                    incrementDisabled: restSeconds >= Self.restRange.upperBound,
-                    onDecrement: {
-                        adjustRest(by: -5)
-                    },
-                    onIncrement: {
-                        adjustRest(by: 5)
-                    }
-                )
-
-                PresetValueControl(
-                    title: "Rounds",
-                    value: "\(rounds) \(rounds == 1 ? "round" : "rounds")",
-                    decrementDisabled: rounds <= Self.roundsRange.lowerBound,
-                    incrementDisabled: rounds >= Self.roundsRange.upperBound,
-                    onDecrement: {
-                        adjustRounds(by: -1)
-                    },
-                    onIncrement: {
-                        adjustRounds(by: 1)
-                    }
-                )
-            }
-
-            if let validationText {
-                Text(validationText)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.76))
-            }
-
-            Button {
-                showsSaveError = !onSave(config, TabataPreset.sanitizedName(name))
-            } label: {
-                Text(saveTitle)
-                    .frame(maxWidth: .infinity, minHeight: 54)
-            }
-            .buttonStyle(.glassProminent)
-            .foregroundStyle(.black)
-            .font(.headline.weight(.bold))
-            .disabled(!canSave)
-
-            Spacer(minLength: 0)
         }
+        .scrollDismissesKeyboard(.interactively)
     }
 
     private var config: TabataConfig {
@@ -199,6 +200,7 @@ private struct PresetValueControl: View {
                 .buttonStyle(.glass)
                 .foregroundStyle(glassControlForeground)
                 .disabled(decrementDisabled)
+                .buttonRepeatBehavior(.enabled)
                 .accessibilityLabel("Decrease \(title)")
 
                 Button(action: onIncrement) {
@@ -209,6 +211,7 @@ private struct PresetValueControl: View {
                 .buttonStyle(.glass)
                 .foregroundStyle(glassControlForeground)
                 .disabled(incrementDisabled)
+                .buttonRepeatBehavior(.enabled)
                 .accessibilityLabel("Increase \(title)")
             }
         }
