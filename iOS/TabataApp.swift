@@ -27,12 +27,15 @@ struct TabataApp: App {
             options.environment = "production"
             #endif
             options.tracesSampleRate = 0.2
+            options.attachScreenshot = true
+            options.attachViewHierarchy = true
         }
 
         TabataDiagnostics.setReporter { context, error in
             if let error {
                 SentrySDK.capture(error: error) { scope in
                     scope.setContext(value: ["detail": context], key: "tabata")
+                    scope.setTag(value: context, key: "operation")
                 }
                 return
             }

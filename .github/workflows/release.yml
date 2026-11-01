@@ -274,7 +274,25 @@ jobs:
           npx --yes @sentry/cli@3.8.2 debug-files upload \
             --org "$SENTRY_ORG" \
             --project "$SENTRY_PROJECT" \
+            --include-sources \
             "$ARCHIVE_PATH/dSYMs"
+
+      # The build is already with testers by now, so a failure here mustn't stop the steps after it.
+      - name: Create Sentry Release
+        if: env.SENTRY_AUTH_TOKEN != ''
+        continue-on-error: true
+        run: |
+          # Must match the release name the SDK builds from the bundle ID, version, and build number.
+          SENTRY_RELEASE="${IOS_BUNDLE_ID}@${VERSION}+${BUILD_NUMBER}"
+
+          sentry_cli() {
+            npx --yes @sentry/cli@3.8.2 "$@"
+          }
+
+          sentry_cli releases new "$SENTRY_RELEASE"
+          sentry_cli releases set-commits "$SENTRY_RELEASE" --auto --ignore-missing
+          sentry_cli releases finalize "$SENTRY_RELEASE"
+          sentry_cli deploys new --release "$SENTRY_RELEASE" --env production
 
       - name: Publish GitHub Release
         env:
