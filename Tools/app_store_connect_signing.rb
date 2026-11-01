@@ -415,6 +415,11 @@ def distribute
     client.post("/v1/betaGroups/#{group.fetch('id')}/relationships/builds", { data: [{ type: "builds", id: build_id }] })
   end
 
+  # Apple can move a build along by itself, and a retry can find one already submitted.
+  state = client.get("/v1/builds/#{build_id}/buildBetaDetail").fetch("data").fetch("attributes").fetch("externalBuildState")
+  puts "External state: #{state}"
+  return unless state == "READY_FOR_BETA_SUBMISSION"
+
   client.post(
     "/v1/betaAppReviewSubmissions",
     {
