@@ -1,0 +1,39 @@
+name: Send to External Testers
+
+# Retries a build that the release couldn't send, without building again.
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: 'Build number'
+        required: true
+      test_notes:
+        description: 'Test notes'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: macos-26
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Send
+        env:
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          BUILD_NUMBER: ${{ github.event.inputs.build_number }}
+          TEST_NOTES: ${{ github.event.inputs.test_notes }}
+          IOS_BUNDLE_ID: com.merimerimeri.tabataticker
+        run: |
+          mkdir -p ~/.private_keys
+          echo "$ASC_API_KEY_P8_BASE64" | base64 --decode -o ~/.private_keys/AuthKey_${ASC_KEY_ID}.p8
+          export ASC_API_KEY_PATH="$HOME/.private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          ruby Tools/app_store_connect_signing.rb distribute
+          rm -rf ~/.private_keys

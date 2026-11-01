@@ -22,3 +22,4 @@ Release setup:
 - App Store/TestFlight setup is documented in [docs/APPSTORE_SETUP.md](docs/APPSTORE_SETUP.md).
 - GitHub release tags use `vX.Y.Z`; the release workflow uploads the build to TestFlight and attaches the exported `.ipa` to the GitHub Release.
 - `refresh-testflight.yml` rebuilds when the last release is 30 days old, because TestFlight builds expire after 90.
+- After upload, every release (monthly rebuilds too) goes to all external TestFlight groups and Beta App Review, with `release_notes` as the test notes or a generic line. `send-to-external-testers.yml` retries a build.

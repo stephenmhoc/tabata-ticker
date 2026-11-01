@@ -295,6 +295,16 @@ jobs:
               --notes "$RELEASE_NOTES"
           fi
 
+      # A rejected submission mustn't fail a release that's already in TestFlight, and
+      # "Send to External Testers" can try again.
+      - name: Send to External Testers
+        continue-on-error: true
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          TEST_NOTES: ${{ github.event.inputs.release_notes }}
+        run: ruby Tools/app_store_connect_signing.rb distribute
+
       - name: Upload Archive Artifact
         uses: actions/upload-artifact@v4
         if: always()

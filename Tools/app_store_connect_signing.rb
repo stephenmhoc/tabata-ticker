@@ -14,6 +14,8 @@ require "uri"
 
 API_BASE = "https://api.appstoreconnect.apple.com"
 PROCESSING_TIMEOUT_MINUTES = 45
+DEFAULT_TEST_NOTES = "Bug fixes and improvements."
+MAX_TEST_NOTES_LENGTH = 4000
 
 def env_fetch(name)
   ENV.fetch(name) do
@@ -72,6 +74,10 @@ class AppStoreConnectClient
 
   def post(path, body)
     request(Net::HTTP::Post, path, body)
+  end
+
+  def patch(path, body)
+    request(Net::HTTP::Patch, path, body)
   end
 
   def delete(path)
@@ -317,27 +323,29 @@ def create_distribution_cert
   end
 end
 
-def wait_for_processing
+def find_app(client)
   bundle_identifier = env_fetch("IOS_BUNDLE_ID")
-  build_number = env_fetch("BUILD_NUMBER")
   app_query = URI.encode_www_form("filter[bundleId]" => bundle_identifier, "limit" => 200)
-  app = AppStoreConnectClient.new.get("/v1/apps?#{app_query}").fetch("data").find do |candidate|
+  app = client.get("/v1/apps?#{app_query}").fetch("data").find do |candidate|
     candidate.fetch("attributes").fetch("bundleId") == bundle_identifier
   end
-  unless app
-    warn "No App Store Connect app has the bundle ID #{bundle_identifier}"
-    exit 1
-  end
+  return app.fetch("id") if app
 
-  build_query = URI.encode_www_form(
-    "filter[app]" => app.fetch("id"),
-    "filter[version]" => build_number,
-    "limit" => 1
-  )
+  warn "No App Store Connect app has the bundle ID #{bundle_identifier}"
+  exit 1
+end
+
+def build_query(app_id)
+  URI.encode_www_form("filter[app]" => app_id, "filter[version]" => env_fetch("BUILD_NUMBER"), "limit" => 1)
+end
+
+def wait_for_processing
+  build_number = env_fetch("BUILD_NUMBER")
+  query = build_query(find_app(AppStoreConnectClient.new))
   deadline = Time.now + (PROCESSING_TIMEOUT_MINUTES * 60)
   while Time.now < deadline
     # A new client each time, because its token only lasts ten minutes.
-    build = AppStoreConnectClient.new.get("/v1/builds?#{build_query}").fetch("data").first
+    build = AppStoreConnectClient.new.get("/v1/builds?#{query}").fetch("data").first
     state = build&.fetch("attributes")&.fetch("processingState") || "not visible yet"
     puts "Build #{build_number}: #{state}"
 
@@ -356,14 +364,79 @@ def wait_for_processing
   exit 1
 end
 
+# Sets the test notes for testers and reviewers.
+def set_test_notes(client, build_id, notes)
+  localizations = client.get("/v1/builds/#{build_id}/betaBuildLocalizations").fetch("data")
+  if localizations.empty?
+    client.post(
+      "/v1/betaBuildLocalizations",
+      {
+        data: {
+          type: "betaBuildLocalizations",
+          attributes: { locale: "en-US", whatsNew: notes },
+          relationships: { build: { data: { type: "builds", id: build_id } } }
+        }
+      }
+    )
+  end
+  localizations.each do |localization|
+    client.patch(
+      "/v1/betaBuildLocalizations/#{localization.fetch('id')}",
+      { data: { type: "betaBuildLocalizations", id: localization.fetch("id"), attributes: { whatsNew: notes } } }
+    )
+  end
+end
+
+# Gives a processed build to every external group and sends it to Beta App Review.
+def distribute
+  client = AppStoreConnectClient.new
+  app_id = find_app(client)
+  build = client.get("/v1/builds?#{build_query(app_id)}").fetch("data").first
+  unless build
+    warn "App Store Connect has no build #{env_fetch('BUILD_NUMBER')}"
+    exit 1
+  end
+  build_id = build.fetch("id")
+
+  groups = client.get("/v1/apps/#{app_id}/betaGroups?limit=200").fetch("data").reject do |group|
+    group.fetch("attributes").fetch("isInternalGroup")
+  end
+  if groups.empty?
+    warn "No external TestFlight group exists for #{env_fetch('IOS_BUNDLE_ID')}"
+    exit 1
+  end
+
+  notes = ENV.fetch("TEST_NOTES", "").strip
+  notes = DEFAULT_TEST_NOTES if notes.empty?
+  set_test_notes(client, build_id, notes[0, MAX_TEST_NOTES_LENGTH])
+
+  groups.each do |group|
+    puts "Adding the build to #{group.fetch('attributes').fetch('name')}"
+    client.post("/v1/betaGroups/#{group.fetch('id')}/relationships/builds", { data: [{ type: "builds", id: build_id }] })
+  end
+
+  client.post(
+    "/v1/betaAppReviewSubmissions",
+    {
+      data: {
+        type: "betaAppReviewSubmissions",
+        relationships: { build: { data: { type: "builds", id: build_id } } }
+      }
+    }
+  )
+  puts "Submitted the build for Beta App Review"
+end
+
 case ARGV.fetch(0, "prepare")
 when "prepare"
   prepare
 when "wait"
   wait_for_processing
+when "distribute"
+  distribute
 when "create-distribution-cert"
   create_distribution_cert
 else
-  warn "Usage: #{File.basename($PROGRAM_NAME)} [prepare|create-distribution-cert|wait]"
+  warn "Usage: #{File.basename($PROGRAM_NAME)} [prepare|create-distribution-cert|wait|distribute]"
   exit 1
 end
