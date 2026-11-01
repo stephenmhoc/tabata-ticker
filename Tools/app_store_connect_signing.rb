@@ -6,11 +6,14 @@ require "fileutils"
 require "json"
 require "net/http"
 require "openssl"
+require "securerandom"
 require "shellwords"
+require "tmpdir"
 require "time"
 require "uri"
 
 API_BASE = "https://api.appstoreconnect.apple.com"
+PROCESSING_TIMEOUT_MINUTES = 45
 
 def env_fetch(name)
   ENV.fetch(name) do
@@ -225,88 +228,142 @@ def append_env(values)
   end
 end
 
+# Finds this certificate's profile for a target, or makes one the first time. Named after the
+# certificate, so that replacing it makes new profiles.
+def fetch_profile(client, name:, identifier:, bundle_name:, certificate_id:, output_path:)
+  query = URI.encode_www_form("filter[name]" => name, "filter[profileState]" => "ACTIVE", "limit" => 200)
+  profile = client.get("/v1/profiles?#{query}").fetch("data").find do |candidate|
+    candidate.fetch("attributes").fetch("name") == name
+  end
+
+  if profile
+    File.binwrite(output_path, Base64.decode64(profile.fetch("attributes").fetch("profileContent")))
+  else
+    create_profile(
+      client,
+      name: name,
+      bundle_id: find_or_create_bundle_id(client, identifier: identifier, name: bundle_name),
+      certificate_id: certificate_id,
+      output_path: output_path
+    )
+  end
+end
+
+# Revoking a certificate invalidates what it signed, and TestFlight review checks the signature
+# after processing (ITMS-90035), so one certificate stays for as long as builds need it.
 def prepare
   client = AppStoreConnectClient.new
   temp_dir = env_fetch("RUNNER_TEMP")
-  run_id = env_fetch("GITHUB_RUN_ID")
-  ios_bundle_identifier = env_fetch("IOS_BUNDLE_ID")
-  watch_bundle_identifier = env_fetch("WATCH_BUNDLE_ID")
-  live_activity_bundle_identifier = env_fetch("LIVE_ACTIVITY_BUNDLE_ID")
+  certificate_id = env_fetch("APPLE_DISTRIBUTION_CERT_ID")
+  p12_path = File.join(temp_dir, "certificate.p12")
+  ios_profile_path = File.join(temp_dir, "ios.mobileprovision")
+  watch_profile_path = File.join(temp_dir, "watch.mobileprovision")
+  live_activity_profile_path = File.join(temp_dir, "live_activity.mobileprovision")
 
   FileUtils.mkdir_p(temp_dir)
+  File.binwrite(p12_path, Base64.decode64(env_fetch("APPLE_DISTRIBUTION_CERT_BASE64")))
 
-  ios_bundle_id = find_or_create_bundle_id(
+  fetch_profile(
     client,
-    identifier: ios_bundle_identifier,
-    name: "Tabata Ticker"
+    name: "Tabata Ticker iOS #{certificate_id}",
+    identifier: env_fetch("IOS_BUNDLE_ID"),
+    bundle_name: "Tabata Ticker",
+    certificate_id: certificate_id,
+    output_path: ios_profile_path
   )
-  watch_bundle_id = find_or_create_bundle_id(
+  fetch_profile(
     client,
-    identifier: watch_bundle_identifier,
-    name: "Tabata Ticker Watch App"
+    name: "Tabata Ticker Watch #{certificate_id}",
+    identifier: env_fetch("WATCH_BUNDLE_ID"),
+    bundle_name: "Tabata Ticker Watch App",
+    certificate_id: certificate_id,
+    output_path: watch_profile_path
   )
-  live_activity_bundle_id = find_or_create_bundle_id(
+  fetch_profile(
     client,
-    identifier: live_activity_bundle_identifier,
-    name: "Tabata Ticker Live Activity"
-  )
-
-  certificate = create_distribution_certificate(client, temp_dir)
-  ios_profile = create_profile(
-    client,
-    name: "Tabata Ticker CI iOS #{run_id}",
-    bundle_id: ios_bundle_id,
-    certificate_id: certificate.fetch(:id),
-    output_path: File.join(temp_dir, "ios.mobileprovision")
-  )
-  watch_profile = create_profile(
-    client,
-    name: "Tabata Ticker CI Watch #{run_id}",
-    bundle_id: watch_bundle_id,
-    certificate_id: certificate.fetch(:id),
-    output_path: File.join(temp_dir, "watch.mobileprovision")
-  )
-  live_activity_profile = create_profile(
-    client,
-    name: "Tabata Ticker CI Live Activity #{run_id}",
-    bundle_id: live_activity_bundle_id,
-    certificate_id: certificate.fetch(:id),
-    output_path: File.join(temp_dir, "live_activity.mobileprovision")
+    name: "Tabata Ticker Live Activity #{certificate_id}",
+    identifier: env_fetch("LIVE_ACTIVITY_BUNDLE_ID"),
+    bundle_name: "Tabata Ticker Live Activity",
+    certificate_id: certificate_id,
+    output_path: live_activity_profile_path
   )
 
   append_env(
-    "APPLE_CERTIFICATE_PATH" => certificate.fetch(:p12_path),
-    "APPLE_CERTIFICATE_PASSWORD" => env_fetch("KEYCHAIN_PASSWORD"),
-    "IOS_PROVISIONING_PROFILE_PATH" => File.join(temp_dir, "ios.mobileprovision"),
-    "WATCH_PROVISIONING_PROFILE_PATH" => File.join(temp_dir, "watch.mobileprovision"),
-    "LIVE_ACTIVITY_PROVISIONING_PROFILE_PATH" => File.join(temp_dir, "live_activity.mobileprovision"),
-    "ASC_CREATED_CERTIFICATE_ID" => certificate.fetch(:id),
-    "ASC_CREATED_PROFILE_IDS" => [ios_profile.fetch(:id), watch_profile.fetch(:id), live_activity_profile.fetch(:id)].join(",")
+    "APPLE_CERTIFICATE_PATH" => p12_path,
+    "APPLE_CERTIFICATE_PASSWORD" => env_fetch("APPLE_DISTRIBUTION_CERT_PASSWORD"),
+    "IOS_PROVISIONING_PROFILE_PATH" => ios_profile_path,
+    "WATCH_PROVISIONING_PROFILE_PATH" => watch_profile_path,
+    "LIVE_ACTIVITY_PROVISIONING_PROFILE_PATH" => live_activity_profile_path
   )
 end
 
-def cleanup
-  client = AppStoreConnectClient.new
-  profile_ids = ENV.fetch("ASC_CREATED_PROFILE_IDS", "").split(",").reject(&:empty?)
-  certificate_id = ENV.fetch("ASC_CREATED_CERTIFICATE_ID", "")
+# Run once by hand, and again when the certificate nears its expiry. Goes straight to GitHub's
+# secrets, so the private key never stays on this machine.
+def create_distribution_cert
+  repo = "stephenmhoc/tabata-ticker"
+  password = SecureRandom.hex(24)
+  ENV["KEYCHAIN_PASSWORD"] = password
+  Dir.mktmpdir do |temp_dir|
+    certificate = create_distribution_certificate(AppStoreConnectClient.new, temp_dir)
+    {
+      "APPLE_DISTRIBUTION_CERT_BASE64" => Base64.strict_encode64(File.binread(certificate.fetch(:p12_path))),
+      "APPLE_DISTRIBUTION_CERT_PASSWORD" => password,
+      "APPLE_DISTRIBUTION_CERT_ID" => certificate.fetch(:id)
+    }.each do |name, value|
+      IO.popen(["gh", "secret", "set", name, "-R", repo], "w") { |gh| gh.write(value) }
+      abort "Couldn't set #{name}." unless $?.success?
+      puts "Set #{name}"
+    end
+  end
+end
 
-  profile_ids.each do |profile_id|
-    puts "Deleting temporary provisioning profile #{profile_id}"
-    client.delete("/v1/profiles/#{profile_id}")
+def wait_for_processing
+  bundle_identifier = env_fetch("IOS_BUNDLE_ID")
+  build_number = env_fetch("BUILD_NUMBER")
+  app_query = URI.encode_www_form("filter[bundleId]" => bundle_identifier, "limit" => 200)
+  app = AppStoreConnectClient.new.get("/v1/apps?#{app_query}").fetch("data").find do |candidate|
+    candidate.fetch("attributes").fetch("bundleId") == bundle_identifier
+  end
+  unless app
+    warn "No App Store Connect app has the bundle ID #{bundle_identifier}"
+    exit 1
   end
 
-  unless certificate_id.empty?
-    puts "Revoking temporary distribution certificate #{certificate_id}"
-    client.delete("/v1/certificates/#{certificate_id}")
+  build_query = URI.encode_www_form(
+    "filter[app]" => app.fetch("id"),
+    "filter[version]" => build_number,
+    "limit" => 1
+  )
+  deadline = Time.now + (PROCESSING_TIMEOUT_MINUTES * 60)
+  while Time.now < deadline
+    # A new client each time, because its token only lasts ten minutes.
+    build = AppStoreConnectClient.new.get("/v1/builds?#{build_query}").fetch("data").first
+    state = build&.fetch("attributes")&.fetch("processingState") || "not visible yet"
+    puts "Build #{build_number}: #{state}"
+
+    case state
+    when "VALID"
+      return
+    when "FAILED", "INVALID"
+      warn "App Store Connect rejected build #{build_number}. Apple's email has the reason."
+      exit 1
+    end
+    sleep 30
   end
+
+  warn "Build #{build_number} wasn't ready after #{PROCESSING_TIMEOUT_MINUTES} minutes. " \
+       "A rejected upload never appears, so check Apple's email."
+  exit 1
 end
 
 case ARGV.fetch(0, "prepare")
 when "prepare"
   prepare
-when "cleanup"
-  cleanup
+when "wait"
+  wait_for_processing
+when "create-distribution-cert"
+  create_distribution_cert
 else
-  warn "Usage: #{File.basename($PROGRAM_NAME)} [prepare|cleanup]"
+  warn "Usage: #{File.basename($PROGRAM_NAME)} [prepare|create-distribution-cert|wait]"
   exit 1
 end

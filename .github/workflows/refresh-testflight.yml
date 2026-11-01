@@ -1,0 +1,50 @@
+name: Refresh TestFlight
+
+# Tabata Ticker ships through TestFlight, where a build expires after 90 days. Checked weekly, so a
+# quiet month gets a new build.
+on:
+  schedule:
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  MAX_AGE_DAYS: 30
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      # GitHub turns off the schedule of a public repository after 60 quiet days.
+      - name: Keep the Schedule Alive
+        run: gh api -X PUT "repos/$GH_REPO/actions/workflows/refresh-testflight.yml/enable"
+
+      - name: Build if the Last One Is a Month Old
+        run: |
+          latest=$(gh api "repos/$GH_REPO/releases/latest")
+          tag=$(jq -r .tag_name <<< "$latest")
+          published=$(jq -r .published_at <<< "$latest")
+          age=$(( ($(date +%s) - $(date -d "$published" +%s)) / 86400 ))
+          echo "Last build: $tag, $age days ago"
+          if [ "$age" -lt "$MAX_AGE_DAYS" ]; then
+            echo "Recent enough."
+            exit 0
+          fi
+
+          # Skips a run of the release workflow that's already going.
+          if [ -n "$(gh run list --workflow release.yml --status in_progress --json databaseId --jq '.[]')" ]; then
+            echo "A release is already running."
+            exit 0
+          fi
+
+          version="${tag#v}"
+          next="${version%.*}.$(( ${version##*.} + 1 ))"
+          echo "Building $next"
+          gh workflow run release.yml --ref "${{ github.event.repository.default_branch }}" \
+            -f version="$next" \
+            -f release_notes="A monthly rebuild, because TestFlight builds expire. It keeps the same code as the last build unless main has moved on."
