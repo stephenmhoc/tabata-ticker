@@ -542,8 +542,9 @@ struct TabataPresentation: Equatable, Sendable {
 
         switch state.phase {
         case .idle:
-            phoneRoundText = config.roundsText
-            watchRoundText = config.roundsText
+            // The clock on the home screen is the whole workout, which nothing else would say.
+            phoneRoundText = "Total time · \(config.roundsText)"
+            watchRoundText = "Total · \(config.roundsText)"
         case .countdown:
             phoneRoundText = "Get ready"
             watchRoundText = "Get ready"

@@ -40,6 +40,7 @@ private enum ContentRoute: Hashable {
 struct ContentView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
     private let viewModel: WorkoutViewModel
     @State private var path: [ContentRoute] = []
 
@@ -111,27 +112,37 @@ struct ContentView: View {
         .onAppear {
             viewModel.activate()
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                viewModel.refreshLiveActivity()
+            }
+        }
     }
 
     // The phase's colour drains away as its time runs out, so how long is left reads from across
     // the room without seeing a digit. Reduce Motion keeps the screen full.
     private var phaseBackdrop: some View {
-        let fraction = reduceMotion ? 1 : viewModel.state.phaseFraction(at: viewModel.now)
+        let state = viewModel.state
         let gradient = LinearGradient(colors: backgroundColors, startPoint: .topLeading, endPoint: .bottomTrailing)
 
         return ZStack {
             gradient
                 .overlay(.black.opacity(0.42))
 
-            gradient
-                .mask(alignment: .bottom) {
-                    GeometryReader { proxy in
-                        Rectangle()
-                            .frame(height: proxy.size.height * fraction)
-                            .frame(maxHeight: .infinity, alignment: .bottom)
+            // Drawn from the display's own clock, because the workout's tick is far too coarse and
+            // uneven to animate from.
+            TimelineView(.animation(paused: !state.isRunning || reduceMotion)) { context in
+                let fraction = reduceMotion ? 1 : state.phaseFraction(at: context.date)
+
+                gradient
+                    .mask(alignment: .bottom) {
+                        GeometryReader { proxy in
+                            Rectangle()
+                                .frame(height: proxy.size.height * fraction)
+                                .frame(maxHeight: .infinity, alignment: .bottom)
+                        }
                     }
-                }
-                .animation(.linear(duration: 0.25), value: fraction)
+            }
         }
         .animation(.smooth(duration: 0.35), value: presentation.title)
         .ignoresSafeArea()
@@ -373,8 +384,8 @@ struct ContentView: View {
 
             if let nextText = presentation.nextText {
                 Text(nextText)
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.6))
                     .contentTransition(.opacity)
             }
         }

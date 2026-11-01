@@ -453,8 +453,8 @@ final class TabataCoreTests: XCTestCase {
         let idle = TabataPresentation(state: engine.state)
 
         XCTAssertEqual(idle.title, "TABATA")
-        XCTAssertEqual(idle.phoneRoundText, "8 rounds")
-        XCTAssertEqual(idle.watchRoundText, "8 rounds")
+        XCTAssertEqual(idle.phoneRoundText, "Total time · 8 rounds")
+        XCTAssertEqual(idle.watchRoundText, "Total · 8 rounds")
         XCTAssertEqual(idle.primaryButtonTitle, "Start")
         XCTAssertEqual(idle.primaryAction, .toggleRunning)
         XCTAssertTrue(idle.isPrimaryButtonProminent)
@@ -503,8 +503,8 @@ final class TabataCoreTests: XCTestCase {
         let state = TabataState.idle(config: TabataConfig.preset(workSeconds: 45, restSeconds: 15, rounds: 6))
         let presentation = TabataPresentation(state: state)
 
-        XCTAssertEqual(presentation.phoneRoundText, "6 rounds")
-        XCTAssertEqual(presentation.watchRoundText, "6 rounds")
+        XCTAssertEqual(presentation.phoneRoundText, "Total time · 6 rounds")
+        XCTAssertEqual(presentation.watchRoundText, "Total · 6 rounds")
     }
 
     private func startWorkout(_ engine: inout TabataEngine, now: Date) {
@@ -572,7 +572,7 @@ final class TabataCoreTests: XCTestCase {
     func testSingleRoundIsSingular() {
         let presentation = TabataPresentation(state: .idle(config: .preset(workSeconds: 20, restSeconds: 10, rounds: 1)))
 
-        XCTAssertEqual(presentation.phoneRoundText, "1 round")
+        XCTAssertEqual(presentation.phoneRoundText, "Total time · 1 round")
     }
 
     func testCompletedRoundsAndPhaseFraction() {

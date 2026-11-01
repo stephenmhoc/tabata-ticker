@@ -1,9 +1,10 @@
 import ActivityKit
 import Foundation
 
+// Every ActivityKit call runs in order away from the main thread, because a request can take long
+// enough to stall the timer on screen just as a workout starts.
 @MainActor
 final class TabataLiveActivityController {
-    private var activity: Activity<TabataLiveActivityAttributes>?
     private var didReportRequestFailure = false
     private var lastOperation: Task<Void, Never>?
 
@@ -29,56 +30,38 @@ final class TabataLiveActivityController {
             relevanceScore: contentState.isRunning ? 1 : 0.5
         )
 
-        let liveActivity = activity ?? Activity<TabataLiveActivityAttributes>.activities.first { $0.activityState == .active }
-        if let existingActivity = liveActivity {
-            activity = existingActivity
-            let activityID = existingActivity.id
-            enqueue {
-                guard let activity = Activity<TabataLiveActivityAttributes>.activities.first(where: { $0.id == activityID }) else {
-                    return
-                }
-
+        enqueue { [weak self] in
+            if let activity = Self.currentActivity {
                 await activity.update(content)
+                return
             }
-            return
-        }
 
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
-            return
-        }
+            guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+                return
+            }
 
-        // A finished workout's card may still be lingering when the next one starts.
-        end()
+            // A finished workout's card may still be lingering when the next one starts.
+            for activity in Activity<TabataLiveActivityAttributes>.activities {
+                await activity.end(nil, dismissalPolicy: .immediate)
+            }
 
-        do {
-            activity = try Activity.request(
-                attributes: TabataLiveActivityAttributes(workoutName: "Tabata"),
-                content: content,
-                pushType: nil
-            )
-        } catch {
-            activity = nil
-
-            // Requesting again on the next phase change is what lets an activity appear once the app
-            // reaches the foreground, so only the first failure of an attempt is worth reporting.
-            if !didReportRequestFailure {
-                didReportRequestFailure = true
-                TabataDiagnostics.report("Starting the Live Activity failed", error: error)
+            do {
+                _ = try Activity.request(
+                    attributes: TabataLiveActivityAttributes(workoutName: "Tabata"),
+                    content: content,
+                    pushType: nil
+                )
+            } catch {
+                await self?.reportRequestFailure(error)
             }
         }
     }
 
     func end() {
-        let activityIDs = Activity<TabataLiveActivityAttributes>.activities.map(\.id)
-        activity = nil
         didReportRequestFailure = false
 
-        guard !activityIDs.isEmpty else {
-            return
-        }
-
         enqueue {
-            for activity in Activity<TabataLiveActivityAttributes>.activities where activityIDs.contains(activity.id) {
+            for activity in Activity<TabataLiveActivityAttributes>.activities {
                 await activity.end(nil, dismissalPolicy: .immediate)
             }
         }
@@ -86,28 +69,35 @@ final class TabataLiveActivityController {
 
     // The card stays up for a minute showing what was done, so the workout doesn't just vanish.
     private func finish(state: TabataState, now: Date) {
-        guard let activityID = activity?.id else {
-            return
-        }
-
         let content = ActivityContent(
             state: TabataLiveActivityAttributes.ContentState(state: state, now: now),
             staleDate: nil
         )
         let dismissal = now.addingTimeInterval(Self.finishedLinger)
-        activity = nil
         didReportRequestFailure = false
 
         enqueue {
-            guard let activity = Activity<TabataLiveActivityAttributes>.activities.first(where: { $0.id == activityID }) else {
-                return
-            }
-
-            await activity.end(content, dismissalPolicy: .after(dismissal))
+            await Self.currentActivity?.end(content, dismissalPolicy: .after(dismissal))
         }
     }
 
-    // ActivityKit calls are async, and a pause and resume in quick succession must land in order.
+    private nonisolated static var currentActivity: Activity<TabataLiveActivityAttributes>? {
+        Activity<TabataLiveActivityAttributes>.activities.first { activity in
+            activity.activityState != .ended && activity.activityState != .dismissed
+        }
+    }
+
+    // Requesting again on the next phase change is what lets an activity appear once the app reaches
+    // the foreground, so only the first failure of an attempt is worth reporting.
+    private func reportRequestFailure(_ error: any Error) {
+        guard !didReportRequestFailure else {
+            return
+        }
+
+        didReportRequestFailure = true
+        TabataDiagnostics.report("Starting the Live Activity failed", error: error)
+    }
+
     private func enqueue(_ operation: @escaping @Sendable () async -> Void) {
         let previous = lastOperation
         lastOperation = Task.detached {

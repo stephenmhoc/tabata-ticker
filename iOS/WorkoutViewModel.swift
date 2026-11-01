@@ -95,6 +95,12 @@ final class WorkoutViewModel {
         TabataShortcuts.updateAppShortcutParameters()
     }
 
+    // Swiping a Live Activity away ends it, and iOS only allows a new one while the app is in front,
+    // so this is the first chance to put it back during a workout.
+    func refreshLiveActivity() {
+        liveActivityController.sync(state: state, now: Date())
+    }
+
     func tick(now: Date = Date()) {
         let oldState = state
         self.now = now
@@ -338,16 +344,19 @@ final class WorkoutViewModel {
     }
 }
 
-@MainActor
-private final class PhoneCuePerformer {
+// AVAudioSession calls block, sometimes for seconds, so all of this runs on its own serial queue. A
+// slow session can delay a beep, but it can't freeze the timer on screen. Everything stored here is
+// only touched on that queue, which is what makes the unchecked Sendable safe.
+private final class PhoneCuePerformer: @unchecked Sendable {
     private static let duckReleaseDelay: TimeInterval = 1.5
 
-    private var players = Players()
-    private var duckRelease: Task<Void, Never>?
+    private let queue = DispatchQueue(label: "com.merimerimeri.tabataticker.audio", qos: .userInitiated)
+    private var players: Players?
+    private var duckRelease: DispatchWorkItem?
+    private var isDucking = false
     private var isWorkoutAudioActive = false
     private var didReportSessionFailure = false
 
-    @MainActor
     private struct Players {
         let countdown = PhoneCuePerformer.makePlayer(TabataTone.tick)
         let work = PhoneCuePerformer.makePlayer(TabataTone.work)
@@ -365,31 +374,39 @@ private final class PhoneCuePerformer {
     }
 
     init() {
-        // The category has to be in place before anything touches the audio hardware: the default
-        // .soloAmbient category stops whatever the user is already listening to.
-        Self.configureSession()
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        queue.async { [self] in
+            // The category has to be in place before anything touches the audio hardware: the default
+            // .soloAmbient category stops whatever the user is already listening to.
+            Self.configureSession()
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
 
-        if !players.isComplete {
-            TabataDiagnostics.report("Workout cue audio could not be prepared")
+            let players = Players()
+            self.players = players
+            if !players.isComplete {
+                TabataDiagnostics.report("Workout cue audio could not be prepared")
+            }
         }
 
         // The tick alone cannot recover from these: without the keep-alive audio iOS may suspend the
         // app, and then the tick never comes.
         let center = NotificationCenter.default
-        center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] notification in
+        center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] notification in
             let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-            guard type == AVAudioSession.InterruptionType.ended.rawValue else {
+            guard type == AVAudioSession.InterruptionType.ended.rawValue, let self else {
                 return
             }
 
-            MainActor.assumeIsolated {
-                self?.resumeKeepAlive()
+            self.queue.async {
+                self.resumeKeepAlive()
             }
         }
-        center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.rebuildAudio()
+        center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil) { [weak self] _ in
+            guard let self else {
+                return
+            }
+
+            self.queue.async {
+                self.rebuildAudio()
             }
         }
     }
@@ -412,13 +429,14 @@ private final class PhoneCuePerformer {
         }
 
         activateSession()
-        players.keepAlive?.play()
+        players?.keepAlive?.play()
     }
 
     // After a media services reset every existing player and the session's setup are dead.
     private func rebuildAudio() {
         Self.configureSession()
         players = Players()
+        isDucking = false
         resumeKeepAlive()
     }
 
@@ -426,33 +444,39 @@ private final class PhoneCuePerformer {
     // on every tick as well as on state changes, so playback picks itself back up after an
     // interruption such as a phone call.
     func setWorkoutAudioActive(_ isActive: Bool) {
-        isWorkoutAudioActive = isActive
+        queue.async { [self] in
+            isWorkoutAudioActive = isActive
 
-        guard isActive else {
-            releaseSessionIfIdle()
-            return
+            guard isActive else {
+                releaseSessionIfIdle()
+                return
+            }
+
+            guard let keepAlivePlayer = players?.keepAlive, !keepAlivePlayer.isPlaying else {
+                return
+            }
+
+            activateSession()
+            keepAlivePlayer.play()
         }
-
-        guard let keepAlivePlayer = players.keepAlive, !keepAlivePlayer.isPlaying else {
-            return
-        }
-
-        activateSession()
-        keepAlivePlayer.play()
     }
 
     func playCountdown() {
-        play(players.countdown)
+        queue.async { [self] in
+            play(players?.countdown)
+        }
     }
 
     func playTransition(_ cue: TabataTransitionCue) {
-        switch cue {
-        case .work:
-            play(players.work)
-        case .rest:
-            play(players.rest)
-        case .finish:
-            play(players.finish)
+        queue.async { [self] in
+            switch cue {
+            case .work:
+                play(players?.work)
+            case .rest:
+                play(players?.rest)
+            case .finish:
+                play(players?.finish)
+            }
         }
     }
 
@@ -462,27 +486,35 @@ private final class PhoneCuePerformer {
         }
 
         duckRelease?.cancel()
-        applyCategoryOptions(ducksOthers: true)
-        activateSession()
+        duckRelease = nil
+
+        // A cue landing inside the delay keeps the current duck instead of retriggering it.
+        if !isDucking {
+            isDucking = true
+            applyCategoryOptions(ducksOthers: true)
+            activateSession()
+        }
+
         player.currentTime = 0
         player.play()
         scheduleDuckRelease(after: player.duration + Self.duckReleaseDelay)
     }
 
     // Other audio stays ducked for as long as the option is set, so it is dropped once the cues stop.
-    // A cue landing inside the delay keeps the current duck instead of retriggering it.
     private func scheduleDuckRelease(after delay: TimeInterval) {
-        duckRelease = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-
-            guard !Task.isCancelled, let self else {
+        let release = DispatchWorkItem { [weak self] in
+            guard let self else {
                 return
             }
 
             self.duckRelease = nil
+            self.isDucking = false
             self.applyCategoryOptions(ducksOthers: false)
             self.releaseSessionIfIdle()
         }
+
+        duckRelease = release
+        queue.asyncAfter(deadline: .now() + delay, execute: release)
     }
 
     // The session is held until the last cue has finished, so ending a workout never clips its final beep.
@@ -491,7 +523,7 @@ private final class PhoneCuePerformer {
             return
         }
 
-        players.keepAlive?.stop()
+        players?.keepAlive?.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
@@ -530,6 +562,8 @@ private final class PhoneCuePerformer {
     }
 
     private static func makePlayer(_ notes: [TabataTone.Note], amplitude: Double = 0.5) -> AVAudioPlayer? {
-        try? AVAudioPlayer(data: TabataTone.waveData(notes, amplitude: amplitude))
+        let player = try? AVAudioPlayer(data: TabataTone.waveData(notes, amplitude: amplitude))
+        player?.prepareToPlay()
+        return player
     }
 }

@@ -16,7 +16,17 @@ final class PhoneConnectivity: NSObject, WCSessionDelegate {
         session.activate()
     }
 
+    // WatchConnectivity writes to disk, so sending stays off the main thread. The queue is serial,
+    // which keeps publishes in order.
+    private nonisolated static let sendQueue = DispatchQueue(label: "com.merimerimeri.tabataticker.connectivity")
+
     func send(_ state: TabataState, catalog: TabataPresetCatalog) {
+        Self.sendQueue.async {
+            Self.deliver(state, catalog: catalog)
+        }
+    }
+
+    private nonisolated static func deliver(_ state: TabataState, catalog: TabataPresetCatalog) {
         guard WCSession.isSupported() else {
             return
         }
